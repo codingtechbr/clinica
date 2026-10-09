@@ -1,0 +1,235 @@
+rules_version = '2';
+
+// Regras de segurança do Cloud Firestore - Clínica
+//  - Paciente só acessa dados vinculados ao próprio UID (patientUid / userId).
+//  - Equipe só acessa dados da clínica a que está vinculada (clinicId).
+//  - O perfil (role) vem de users/{uid} e não pode ser alterado pelo próprio usuário.
+//  - Tudo que não estiver liberado explicitamente é negado.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ---------- Funções auxiliares ---------- */
+
+    function signedIn() { return request.auth != null; }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function hasProfile() { return signedIn() && exists(userPath(request.auth.uid)); }
+    function me() { return get(userPath(request.auth.uid)).data; }
+    function staffRoles() { return ['RECEPTIONIST', 'TECHNICIAN', 'MANAGER', 'ADMIN', 'SUPER_ADMIN']; }
+    function isStaff() { return hasProfile() && me().active == true && me().role in staffRoles(); }
+    function isPatient() { return hasProfile() && me().active == true && me().role == 'PATIENT'; }
+    function inClinic(clinicId) { return me().clinicId == clinicId || me().role == 'SUPER_ADMIN'; }
+    function staffOf(clinicId) { return isStaff() && inClinic(clinicId); }
+    function roleOf(clinicId, roles) { return isStaff() && me().role in roles && inClinic(clinicId); }
+    function isUser(uid) { return signedIn() && request.auth.uid == uid; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function changedKeys() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function sameClinic() { return incoming().clinicId == existing().clinicId; }
+    function catalogRoles() { return ['MANAGER', 'ADMIN', 'SUPER_ADMIN']; }
+    function adminRoles() { return ['ADMIN', 'SUPER_ADMIN']; }
+    function schedulingRoles() { return ['RECEPTIONIST', 'MANAGER', 'ADMIN', 'SUPER_ADMIN']; }
+
+    /* ---------- Clínica (dados públicos de contato) ---------- */
+
+    match /clinics/{clinicId} {
+      allow read: if true;
+      allow create, update: if roleOf(clinicId, adminRoles());
+      allow delete: if false;
+    }
+
+    /* ---------- Usuários ---------- */
+
+    match /users/{uid} {
+      allow read: if isUser(uid) || staffOf(existing().clinicId);
+
+      allow create: if (isUser(uid)
+            && incoming().role == 'PATIENT'
+            && incoming().patientId == uid
+            && incoming().active == true
+            && incoming().clinicId is string
+            && incoming().keys().hasOnly(['clinicId', 'patientId', 'role', 'email', 'name', 'active', 'createdAt', 'updatedAt']))
+        || (roleOf(incoming().clinicId, adminRoles())
+            && incoming().role in ['RECEPTIONIST', 'TECHNICIAN', 'MANAGER', 'ADMIN']);
+
+      allow update: if (isUser(uid) && changedKeys().hasOnly(['fcmTokens', 'updatedAt']))
+        || (roleOf(existing().clinicId, adminRoles())
+            && !isUser(uid)
+            && existing().role in staffRoles()
+            && existing().role != 'SUPER_ADMIN'
+            && incoming().role in ['RECEPTIONIST', 'TECHNICIAN', 'MANAGER', 'ADMIN']
+            && sameClinic());
+
+      allow delete: if false;
+    }
+
+    /* ---------- CPF único ---------- */
+
+    match /cpfIndex/{cpf} {
+      allow read: if isStaff();
+      allow create: if signedIn()
+        && cpf.size() == 11
+        && incoming().uid == request.auth.uid
+        && incoming().keys().hasOnly(['uid', 'clinicId', 'createdAt']);
+      allow update, delete: if false;
+    }
+
+    /* ---------- Pacientes ---------- */
+
+    match /patients/{patientId} {
+      allow read: if isUser(patientId) || staffOf(existing().clinicId);
+
+      allow create: if isUser(patientId)
+        && incoming().authUid == request.auth.uid
+        && incoming().status == 'ACTIVE'
+        && incoming().cpf is string
+        && incoming().cpf.size() == 11
+        && existsAfter(/databases/$(database)/documents/cpfIndex/$(incoming().cpf))
+        && getAfter(/databases/$(database)/documents/cpfIndex/$(incoming().cpf)).data.uid == request.auth.uid
+        && getAfter(userPath(request.auth.uid)).data.clinicId == incoming().clinicId;
+
+      allow update: if (isUser(patientId) && changedKeys().hasOnly(['phone', 'address', 'updatedAt']))
+        || (staffOf(existing().clinicId) && sameClinic()
+            && incoming().cpf == existing().cpf && incoming().authUid == existing().authUid);
+
+      allow delete: if false;
+    }
+
+    /* ---------- Catálogo (público: lista de exames, preços e convênios) ---------- */
+
+    match /services/{serviceId} {
+      allow read: if true;
+      allow create: if roleOf(incoming().clinicId, catalogRoles());
+      allow update: if roleOf(existing().clinicId, catalogRoles()) && sameClinic();
+      allow delete: if false;
+    }
+
+    match /insurances/{insuranceId} {
+      allow read: if true;
+      allow create: if roleOf(incoming().clinicId, catalogRoles());
+      allow update: if roleOf(existing().clinicId, catalogRoles()) && sameClinic();
+      allow delete: if false;
+    }
+
+    match /knowledgeBase/{articleId} {
+      allow read: if signedIn();
+      allow create: if roleOf(incoming().clinicId, catalogRoles());
+      allow update: if roleOf(existing().clinicId, catalogRoles()) && sameClinic();
+      allow delete: if false;
+    }
+
+    /* ---------- Contador de protocolos ---------- */
+
+    match /counters/{counterId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && incoming().value == 1
+        && incoming().keys().hasOnly(['value', 'clinicId', 'updatedAt']);
+      allow update: if signedIn()
+        && incoming().value == existing().value + 1
+        && changedKeys().hasOnly(['value', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    /* ---------- Agendamentos ---------- */
+
+    match /appointments/{appointmentId} {
+      function apptPath() { return /databases/$(database)/documents/appointments/$(appointmentId); }
+      function parent() { return get(apptPath()).data; }
+      function parentAfter() { return getAfter(apptPath()).data; }
+      function isOwner() { return signedIn() && existing().patientUid == request.auth.uid; }
+
+      allow read: if isOwner() || staffOf(existing().clinicId);
+
+      // Paciente cria o PEDIDO. Horário, resultado e confirmação nunca vêm do paciente.
+      allow create: if isPatient()
+        && incoming().patientUid == request.auth.uid
+        && incoming().patientId == request.auth.uid
+        && incoming().createdBy == request.auth.uid
+        && incoming().clinicId == me().clinicId
+        && incoming().status == 'REQUESTED'
+        && incoming().scheduledFor == null
+        && incoming().resultStatus == null
+        && incoming().patientConfirmed == false
+        && incoming().kind in ['CONSULTATION', 'EXAM']
+        && incoming().payment.type in ['PRIVATE', 'INSURANCE']
+        && incoming().protocol is string
+        && incoming().keys().hasOnly([
+          'clinicId', 'patientId', 'patientUid', 'patientName', 'patientCpf', 'patientPhone',
+          'serviceId', 'serviceName', 'kind', 'specialty', 'price', 'preparation', 'resultDays',
+          'payment', 'preferredDate', 'preferredPeriod', 'notes', 'protocol', 'status',
+          'scheduledFor', 'patientConfirmed', 'resultStatus', 'requestedAt', 'createdBy', 'createdAt', 'updatedAt'
+        ]);
+
+      // Paciente: confirmar presença (SCHEDULED -> CONFIRMED) ou cancelar o próprio agendamento ativo.
+      // Equipe: altera agendamentos da clínica; horário e cancelamento só pela recepção/gestão.
+      allow update: if (isOwner()
+            && existing().status == 'SCHEDULED' && incoming().status == 'CONFIRMED'
+            && incoming().patientConfirmed == true
+            && changedKeys().hasOnly(['status', 'patientConfirmed', 'updatedAt']))
+        || (isOwner()
+            && existing().status in ['REQUESTED', 'SCHEDULED', 'CONFIRMED'] && incoming().status == 'CANCELLED'
+            && incoming().cancelledBy == request.auth.uid
+            && changedKeys().hasOnly(['status', 'cancelReason', 'cancelledBy', 'cancelledAt', 'updatedAt']))
+        || (staffOf(existing().clinicId)
+            && sameClinic()
+            && incoming().patientUid == existing().patientUid
+            && incoming().patientId == existing().patientId
+            && (!changedKeys().hasAny(['status', 'scheduledFor']) || roleOf(existing().clinicId, schedulingRoles())));
+
+      allow delete: if false;
+
+      match /history/{historyId} {
+        allow read: if signedIn() && (parent().patientUid == request.auth.uid || staffOf(parent().clinicId));
+        allow create: if signedIn()
+          && incoming().changedBy == request.auth.uid
+          && ((parentAfter().patientUid == request.auth.uid && incoming().newStatus == parentAfter().status)
+            || staffOf(parentAfter().clinicId));
+        allow update, delete: if false;
+      }
+
+      match /documents/{documentId} {
+        allow read: if signedIn() && (parent().patientUid == request.auth.uid || staffOf(parent().clinicId));
+        allow create: if signedIn()
+          && ((parentAfter().patientUid == request.auth.uid
+                && parentAfter().status in ['REQUESTED', 'SCHEDULED', 'CONFIRMED']
+                && incoming().uploadedBy == request.auth.uid
+                && incoming().status == 'PENDING'
+                && incoming().storagePath.matches('clinics/' + parentAfter().clinicId + '/patients/' + request.auth.uid + '/appointments/' + appointmentId + '/.*'))
+            || staffOf(parentAfter().clinicId));
+        allow update: if staffOf(parent().clinicId)
+          && changedKeys().hasOnly(['status', 'reviewedBy', 'reviewedByName', 'reviewedAt', 'reviewReason']);
+        allow delete: if false;
+      }
+    }
+
+    /* ---------- Avisos ---------- */
+
+    match /notifications/{notificationId} {
+      allow read: if (signedIn() && existing().userId == request.auth.uid) || staffOf(existing().clinicId);
+      allow create: if staffOf(incoming().clinicId);
+      allow update: if signedIn() && existing().userId == request.auth.uid && changedKeys().hasOnly(['read', 'readAt']);
+      allow delete: if false;
+    }
+
+    /* ---------- Assistente de IA (escrita somente pela Cloud Function) ---------- */
+
+    match /aiConversations/{conversationId} {
+      allow read: if signedIn() && existing().userId == request.auth.uid;
+      allow write: if false;
+      match /messages/{messageId} {
+        allow read: if signedIn()
+          && get(/databases/$(database)/documents/aiConversations/$(conversationId)).data.userId == request.auth.uid;
+        allow write: if false;
+      }
+    }
+
+    /* ---------- Auditoria (somente inclusão) ---------- */
+
+    match /auditLogs/{auditId} {
+      allow read: if roleOf(existing().clinicId, catalogRoles());
+      allow create: if staffOf(incoming().clinicId) && incoming().userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}
